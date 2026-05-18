@@ -113,7 +113,10 @@ async def heartbeat(stop_event: asyncio.Event):
                 dead.append(ws)
         for ws in dead:
             del connected_clients[ws]
-        await asyncio.wait_for(stop_event.wait(), timeout=30)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass  # loop continues — re-checks stop_event at top
 
 
 async def main(host="0.0.0.0", port=8765):
