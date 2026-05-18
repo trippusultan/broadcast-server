@@ -130,7 +130,7 @@ def _build_layout() -> Layout:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def reader(ws):
-    """Receive frames, append to state.history."""
+    """Receive frames, append to state.history and update users list."""
     try:
         async for raw in ws:
             try:
@@ -143,10 +143,19 @@ async def reader(ws):
                 text = msg.get("message", "")
                 key = "own" if user == state["username"] else "msg"
                 state["history"].append((key, user, text))
+                state["users"].add(user)
             elif mtype == "system":
                 state["history"].append(("sys", msg.get("message", "")))
             elif mtype == "history":
                 state["history"].append(("hist", msg.get("username","?"), msg.get("message","")))
+            elif mtype == "join":
+                user = msg.get("message", "").replace(" joined", "").strip()
+                if user:
+                    state["users"].add(user)
+            elif mtype == "leave":
+                user = msg.get("message", "").replace(" left", "").strip()
+                if user and user in state["users"]:
+                    state["users"].discard(user)
             else:
                 state["history"].append(("err", str(msg)))
             # trim
