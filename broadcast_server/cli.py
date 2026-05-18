@@ -6,13 +6,20 @@ import os
 import click
 
 from broadcast_server.auth import register_user
+from broadcast_server.ui import chat as ui_chat
 
 
 @click.group()
 @click.version_option()
-def cli():
+@click.option("--ui", "ui_mode", default=None,
+              type=click.Choice(["classic", "fancy", "auto"], case_sensitive=False),
+              help="Terminal UI mode (classic / fancy / auto). 'auto' uses fancy when Rich is available.")
+def cli(ui_mode):
     """Broadcast Server — WebSocket real-time messaging."""
-    pass
+    if ui_mode == "auto":
+        os.environ["BROADCAST_UI"] = "fancy"
+    elif ui_mode:
+        os.environ["BROADCAST_UI"] = ui_mode
 
 
 @cli.command()
@@ -31,14 +38,8 @@ def start(host, port):
 @click.option("--password", "-p", default="", hide_input=True)
 def connect(url, username, password):
     """Connect to a broadcast server as a client."""
-    from broadcast_server.client import connect as _connect
-    # Re-use client logic via import trick
-    import asyncio
-    from broadcast_server.client import chat
-    try:
-        asyncio.run(chat(url, username, password))
-    except KeyboardInterrupt:
-        click.echo("\nDisconnected.")
+    ui = os.environ.get("BROADCAST_UI", "fancy")
+    ui_chat(url, username, password, mode=None)
 
 
 @cli.command()
@@ -46,8 +47,8 @@ def connect(url, username, password):
 @click.option("--password", "-p", prompt="Password", hide_input=True, required=True)
 def register(username, password):
     """Register a new user (saved locally for server auth)."""
-    from broadcast_server.auth import register_user
-    if register_user(username, password):
+    from broadcast_server.auth import register_user as _reg
+    if _reg(username, password):
         click.echo(f"User '{username}' registered successfully.")
     else:
         click.echo(f"User '{username}' already exists.", err=True)
