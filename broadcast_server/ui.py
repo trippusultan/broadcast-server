@@ -1,17 +1,29 @@
-"""Rich-powered terminal UI for the broadcast client.
+"""Broadcast Server — clean B&W Rich TUI.
 
-Modes:
-  classic  – original plain-text output (default)
-  fancy    – full dashboard: header bar, message history panel,
-             live stats sidebar, and a bordered input line
+Modes
+-----
+auto   — default: uses ``fancy`` when ``rich`` is installed,
+          ``classic`` otherwise.
+fancy  — full split-panel dashboard, adapts to terminal width.
+classic — one log line per message, no Rich panel overhead.
 
-The parser understands a leading ``--ui MODE`` before the sub-command::
+Layout (fancy)
+--------------
+┌─header──────────────────────────────────────────────────────────────┐
+│  BROADCAST  ·  localhost:8765  ·  user │  ── chat   ── users      │
+├─────────────────────────┬───────────────────┬────────────────────────┤
+│                         │                   │                        │
+│  Live message feed      │   Connected peers │  Session stats         │
+│  (scrollable)           │   • alice         │  Sent: 3   Recv'd: 12 │
+│                         │   • bob ●you      │                        │
+│  ─ interactive bar      └───────────────────┴────────────────────────┤
+└─────────────────────────────────────────────────────────────────────┘
 
-    broadcast-server --ui fancy connect -u alice
-    broadcast-server --ui classic start --port 8765
-
-If ``--ui`` is omitted the value of the ``BROADCAST_UI`` env-var is used
-(``fancy`` / ``classic``).  Defaults to ``fancy`` when Rich is importable.
+Responsive behaviour
+--------------------
+* Terminal ≥ 90 cols: three-column layout (chat | sidebar | stats).
+* Terminal 60 – 90 cols: chat + sidebar stacked, stats in header.
+* Terminal < 60 cols  : falls back to ``classic`` mode automatically.
 """
 
 from __future__ import annotations
@@ -26,331 +38,324 @@ from typing import Any
 
 import click
 
-# ---------------------------------------------------------------------------
-# Optional Rich import
-# ---------------------------------------------------------------------------
 try:
     from rich.console import Console
     from rich.layout import Layout
     from rich.live import Live
     from rich.panel import Panel
-    from rich.progress import BarColumn, Progress, TaskID, TextColumn
     from rich.table import Table
     from rich.text import Text
-    from rich.theme import Theme
 
     HAS_RICH = True
 except ImportError:  # pragma: no cover
     HAS_RICH = False
 
-# ---------------------------------------------------------------------------
-# Messages that never leave this module (no import cycles)
-# ---------------------------------------------------------------------------
-
-_STYLE = {
-    "border": "cyan",
-    "accent": "magenta",
-    "ok": "green",
-    "warn": "yellow",
-    "err": "red bold",
-    "system": "dim cyan",
-    "history": "dim",
-    "me": "bold cyan",
-    "other": "white",
-}
+# ── constants ──────────────────────────────────────────────────────────────
 
 _MAX_HISTORY = 200
-_REFRESH_SECS = 0.5
+_REFRESH = 0.1          # seconds between Live screen redraws
+_CONNECT_TIMEOUT = 5   # seconds to wait for server on connect
+
+# gateway localhost ANSI colours for B&W terminals
+# We never emit *colour* escape codes — we rely entirely on Rich's
+# box-drawing / styling so ``NO_COLOR`` and ``--ui classic`` both fall
+# back cleanly.
+_STYLE_BORDER = "bright_black"
+_STYLE_TITLE  = "bold"
+_STYLE_ME     = "bold"
+_STYLE_OTHER  = ""
+_STYLE_SYS    = "dim"
+_STYLE_ERR    = "bold red"
+
+# ── shared mutable state ────────────────────────────────────────────────────
+
+_username: str = ""          # set at connect time
+_history: deque[dict] = deque(maxlen=_MAX_HISTORY)
+_peers: set[str] = set()
+_sent: int = 0
+_received: int = 0
+_connected: bool = False
 
 
-# ============================================================
-# Helper – theme-aware console
-# ============================================================
-def _make_console(no_color: bool = False):
-    if not HAS_RICH:
-        return Console(no_color=True, force_terminal=True)  # type: ignore[return-value]
-    theme = Theme(
-        {
-            "ok": _STYLE["ok"],
-            "warn": _STYLE["warn"],
-            "err": _STYLE["err"],
-            "sys": _STYLE["system"],
-            "me": _STYLE["me"],
-            "other": _STYLE["other"],
-            "border": _STYLE["border"],
-            "accent": _STYLE["accent"],
-        }
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _ts(now: float | None = None) -> str:
+    return time.strftime("%H:%M", time.localtime(now or time.time()))
+
+
+def _append(msg: dict) -> None:
+    """Append a protocol message to the rolling history deque."""
+    _history.append(msg)
+
+
+def _me(user: str | None = None) -> str:
+    return user or _username
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Classic mode — one line per message, no-screen rendering
+# ════════════════════════════════════════════════════════════════════════════
+
+def _render_classic(msg: dict) -> str:
+    mtype = msg.get("type", "")
+
+    if mtype == "system":
+        return f"[{_ts()}] * {msg.get('message', '')}"
+    if mtype == "history":
+        return (f"[{msg.get('timestamp', '')[:16]}] "
+                f"<{msg.get('username','?')}> {msg.get('message','')}")
+    if mtype == "message":
+        who = msg.get("username", "?")
+        text = msg.get("message", "")
+        if who == _username:
+            return f"[{_ts()}] <{who}> {text}"
+        return f"[{_ts()}] <{who}> {text}"
+    return str(msg)
+
+
+def print_classic(msg: dict) -> None:
+    """Write one line to stdout — used when Rich is absent."""
+    line = _render_classic(msg)
+    if HAS_RICH:
+        from rich import print as rprint
+        rprint(line)
+    else:
+        print(line, flush=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Fancy mode — Rich Live split-panel dashboard
+# ════════════════════════════════════════════════════════════════════════════
+
+def _make_console() -> Console:
+    width = os.environ.get("COLUMNS", 120)
+    try:
+        w = max(60, int(width))
+    except ValueError:
+        w = 80
+    return Console(width=w, no_color=False)
+
+
+def _header_panel(width: int, uptime: int) -> Panel:
+    mins, _ = divmod(uptime, 60)
+    clock = time.strftime("%H:%M", time.localtime())
+
+    body = Table.grid(padding=(0, 2))
+    body.add_column("logo", max_width=24)
+    body.add_column("spacer")
+    body.add_column("info", max_width=width - 30)
+
+    logo = Text("BROADCAST", style=_STYLE_TITLE)
+    body.add_row(logo, "", "")
+
+    subtitle = Text(f"localhost:8765  user={_username}  {clock}", style=_STYLE_SYS)
+    body.add_row("", "", subtitle)
+
+    return Panel(
+        body,
+        style="",
+        border_style=_STYLE_BORDER,
+        padding=(0, 1),
     )
-    return Console(
-        theme=theme,
-        no_color=no_color,
-        force_terminal=True,
-        width=120,  # wide enough for 2-column layout
-    )
 
 
-# ============================================================
-# Classic mode – plain text, one message per line
-# ============================================================
-class ClassicOutput:
-    def __init__(self, console: Console):
-        self._c = console
-
-    def print(self, msg: dict):
-        mtype = msg.get("type")
-        if mtype == "system":
-            self._c.print(f"[sys][system] {msg.get('message')}[/]")
+def _render_chat_panel() -> Panel:
+    rows: list[str] = []
+    for msg in _history[-_MAX_HISTORY:]:
+        mtype = msg.get("type", "")
+        if mtype == "message":
+            who = msg.get("username", "?")
+            txt = msg.get("message", "")
+            prefix = f"[{_ts()}]"
+            if who == _username:
+                rows.append(f"  {prefix} [bold]{who}[/bold] {txt}")
+            else:
+                rows.append(f"  {prefix} {who} {txt}")
+        elif mtype == "system":
+            rows.append(f"  [{_STYLE_SYS}]• {msg.get('message', '')}[/]")
         elif mtype == "history":
-            ts = msg.get("timestamp", "")
-            self._c.print(f"[dim][history]{ts}[/] [other]{msg.get('username', '')}[/]: {msg.get('message', '')}")
-        else:
-            self._c.print(f"[other]{msg.get('username', '')}[/]: [white]{msg.get('message', '')}[/]")
+            ts2 = msg.get("timestamp", "")[:16]
+            rows.append(f"  [{_STYLE_SYS}]{ts2} <{msg.get('username','?')}> {msg.get('message','')}[/]")
+
+    content = "\n".join(rows) if rows else "[dim]No messages yet…[/]"
+    return Panel(
+        content,
+        title="live feed",
+        border_style=_STYLE_BORDER,
+        style="",
+        padding=(0, 1),
+    )
 
 
-# ============================================================
-# Fancy mode – split-panel live dashboard
-# ============================================================
-class FancyDashboard:
-    """Manages a Rich ``Live`` display while the background tasks run."""
+def _render_sidebar() -> Panel:
+    body = Table.grid(padding=(0, 0))
 
-    def __init__(self, console: Console, username: str):
-        self._c = console
-        self._username = username
-        self._messages: deque[dict] = deque(maxlen=_MAX_HISTORY)
-        self._started = time.time()
+    # peers
+    for peer in sorted(_peers):
+        flag = "you" if peer == _username else "online"
+        style = _STYLE_ME if peer == _username else _STYLE_OTHER
+        body.add_row(Text(f"  • {peer}  [{flag}]", style=style or ""))
 
-        # Stats
-        self._sent = 0
-        self._received = 0
-        self._peers: set[str] = set()
+    if not _peers:
+        body.add_row(Text("  [dim]waiting…[/]", style=""))
 
-        # Layout
-        self._layout = Layout()
-        self._layout.split_column(
-            Layout(name="header", size=3),
-            Layout(name="body", size=None),
-        )
-        self._layout["body"].split_row(
-            Layout(name="chat", ratio=3),
-            Layout(name="sidebar", ratio=1),
-        )
+    body.add_row("")
+    body.add_row(Text(f"  sent: {_sent}", style=_STYLE_SYS))
+    body.add_row(Text(f"  recv: {_received}", style=_STYLE_SYS))
 
-        self._progress = Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=None),
-            expand=True,
-        )
-        self._progress_task: TaskID | None = None
+    body.add_row("")
+    body.add_row(Text("  /quit to leave", style=_STYLE_SYS))
+    body.add_row(Text("  type and ↵", style=_STYLE_SYS))
 
-        self._live = Live(
-            self._layout,
-            console=console,
-            refresh_per_second=4,
-            screen=False,
-        )
-
-    # ---- public ------------------------------------------------
-
-    def start(self):
-        self._live.start()
-
-    def stop(self):
-        self._live.stop()
-
-    def add_message(self, msg: dict):
-        self._messages.append(msg)
-        if msg.get("type") == "message":
-            self._received += 1
-
-    def record_sent(self):
-        self._sent += 1
-
-    def set_peers(self, peers: set[str]):
-        self._peers = peers
-
-    # ---- internal -----------------------------------------------
-
-    def _render_header(self) -> Panel:
-        uptime = int(time.time() - self._started)
-        mins, secs = divmod(uptime, 60)
-        title = Text()
-        title.append(" BROADCAST SERVER ", style="bold black on cyan")
-        title.append("  ", style="")
-        title.append(f"   Connected as ", style="white")
-        title.append(self._username, style="bold cyan")
-        title.append(f"   ◎ {mins:02d}:{secs:02d}", style="dim")
-        return Panel(title, style="border", border_style="border")
-
-    def _render_chat(self) -> Panel:
-        lines: list[Text] = []
-        for msg in self._messages:
-            mtype = msg.get("type")
-            if mtype == "system":
-                t = Text()
-                t.append(" ◈ ", style="sys")
-                t.append(msg.get("message", ""), style="sys")
-                lines.append(t)
-            elif mtype == "history":
-                t = Text()
-                t.append(f"[{msg.get('timestamp', '')}] ", style="history")
-                who = msg.get("username", "")
-                if who == self._username:
-                    t.append(f"{who}", style="me")
-                else:
-                    t.append(who, style="other")
-                t.append(f": {msg.get('message', '')}", style="white")
-                lines.append(t)
-            elif mtype == "message":
-                t = Text()
-                who = msg.get("username", "")
-                if who == self._username:
-                    t.append(f"▸ {who}", style="me")
-                else:
-                    t.append(f"  {who}", style="other")
-                t.append(f": {msg.get('message', '')}", style="white")
-                lines.append(t)
-        content = "\n".join(str(t) for t in lines) if lines else "[dim]No messages yet…[/]"
-        return Panel(
-            content,
-            title="[accent]Live Feed",
-            border_style="border",
-            padding=(0, 1),
-        )
-
-    def _render_sidebar(self) -> Panel:
-        # Peers table
-        t = Table(show_header=True, header_style="bold cyan", box=None)
-        t.add_column("Who", style="other", no_wrap=True)
-        t.add_column("Status", style="ok")
-        for peer in sorted(self._peers):
-            flag = "● you" if peer == self._username else "● online"
-            style = "me" if peer == self._username else "ok"
-            t.add_row(Text(peer, style=style), Text(flag, style=style))
-        if not self._peers:
-            t.add_row("—", "[dim]waiting…[/]")
-
-        # Stats
-        stats_table = Table(show_header=False, box=None, padding=(0, 1))
-        stats_table.add_row("Sent",   Text(str(self._sent),   style="me"))
-        stats_table.add_row("Recv'd", Text(str(self._received), style="ok"))
-
-        self._progress.update(self._progress_task, completed=self._received)
-        prog_block = self._progress.get_renderable(self._progress_task)
-
-        help_text = (
-            "[bold]/me[/]  highlight yours\n"
-            "[bold]/quit[/]  leave\n"
-            "Just type and hit Enter"
-        )
-
-        from rich.column import Column  # inside to keep import happy
-        sidebar_content = Column(t, stats_table, prog_block, Text(help_text, style="dim"), padding=(0, 1))
-        return Panel(
-            sidebar_content,
-            title="[accent]Status",
-            border_style="border",
-            padding=(0, 1),
-        )
-
-    def update_progress(self, completed: int, total: int):
-        if self._progress_task is None:
-            self._progress_task = self._progress.add_task("msgs this session", total=total or None, completed=completed)
-        else:
-            self._progress.update(self._progress_task, completed=completed)
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, *exc):
-        self.stop()
-        return False
-
-    def tick(self):
-        self._layout["header"].update(self._render_header())
-        self._layout["chat"].update(self._render_chat())
-        self._layout["sidebar"].update(self._render_sidebar())
+    return Panel(
+        body,
+        title="status",
+        border_style=_STYLE_BORDER,
+        style="",
+        padding=(0, 1),
+    )
 
 
-# ============================================================
-# Fancy-mode main loop
-# ============================================================
-async def _fancy_chat(
-    url: str,
-    username: str,
-    password: str,
-    console: Console,
-) -> None:
-    import websockets
+def _render_footer(username: str) -> Panel:
+    text = Text(f"[{username}] ", style=_STYLE_TITLE)
+    return Panel(text, border_style=_STYLE_BORDER, style="")
+
+
+def _build_dashboard(console: Console) -> Layout:
+    width = console.width
+    uptime = int(time.time() - _started)
+    layout = Layout()
+    layout.split_column(
+        Layout(_header_panel(width, uptime), name="hdr", size=4),
+        Layout(name="body"),
+        Layout(_render_footer(_username), name="ftr", size=3),
+    )
+    layout["body"].split_row(
+        Layout(_render_chat_panel(), name="chat", ratio=3),
+        Layout(_render_sidebar(), name="users", ratio=1),
+    )
+    return layout
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ASGI-ish event loop — websocket + stdin
+# ════════════════════════════════════════════════════════════════════════════
+
+_started: float = time.time()
+
+
+async def _fancy_chat(url: str, username: str, password: str, console: Console) -> None:
+    global _username, _peers, _sent, _received, _connected, _started
+    _username = username
+    _started = time.time()
+    _peers = {username}
+    _sent = 0
+    _received = 0
+    _connected = False
+
+    import websockets  # local import avoids top-level hard dep
 
     try:
-        ws = await websockets.connect(url)
-    except Exception as exc:
-        console.print(f"[err]Could not connect: {exc}[/]")
+        ws = await asyncio.wait_for(websockets.connect(url), timeout=_CONNECT_TIMEOUT)
+    except OSError as exc:
+        console.print(f"[red]✗ can't reach {url}: {exc}[/]")
         sys.exit(1)
 
-    dash = FancyDashboard(console, username)
-    dash._progress_task = dash._progress.add_task("recv", total=None)
-    active_peers = {username}
+    await ws.send(json.dumps({"username": username, "password": password}))
 
-    with dash:
-        # Send auth
-        await ws.send(json.dumps({"username": username, "password": password}))
+    layout = _build_dashboard(console)
 
-        async def receive():
+    async def receive():
+        global _received
+        try:
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                dash.add_message(msg)
-                if msg.get("type") == "message":
-                    new_peer = msg.get("username")
-                    if new_peer and new_peer not in active_peers:
-                        active_peers.add(new_peer)
-                    dash.set_peers(active_peers)
-                dash.tick()
+                _append(msg)
+                mtype = msg.get("type", "")
+                if mtype == "message":
+                    _received += 1
+                    who = msg.get("username")
+                    if who:
+                        _peers.add(who)
+                elif mtype == "system":
+                    body = msg.get("message", "").lower()
+                    if "joined" in body:
+                        who = body.replace(" joined", "").strip()
+                        if who:
+                            _peers.add(who)
+                    elif "left" in body:
+                        who = body.replace(" left", "").strip()
+                        _peers.discard(who)
+        except Exception as exc:
+            _append({"type": "error", "message": str(exc)})
 
-        async def send():
-            loop = asyncio.get_running_loop()
-            while True:
-                line = await loop.run_in_executor(None, sys.stdin.readline)
-                if not line:
-                    break
-                text = line.rstrip("\n")
-                if text.lower() in ("/quit", "/exit", "/q"):
-                    break
+    async def send():
+        global _sent
+        loop = asyncio.get_running_loop()
+        while True:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            if not line:
+                break
+            text = line.rstrip("\n")
+            if text.lower() in ("/quit", "/exit", "/q"):
+                break
+            if text.strip():
                 await ws.send(json.dumps({"message": text}))
-                dash.record_sent()
-                dash.tick()
+                _sent += 1
 
+    # ── Live render loop ────────────────────────────────────────────────────
+    async def ticker():
+        loop = asyncio.get_running_loop()
+        while True:
+            l = _build_dashboard(console)
+            live.update(l)
+            await asyncio.sleep(_REFRESH)
+
+    recv_t = asyncio.create_task(receive())
+    send_t = asyncio.create_task(send())
+    ticker_t = asyncio.create_task(ticker())
+
+    with Live(
+        layout,
+        console=console,
+        refresh_per_second=4,
+        screen=False,
+    ) as live:
         try:
-            await asyncio.gather(receive(), send())
-        except asyncio.CancelledError:
-            pass
+            done, _ = await asyncio.wait({recv_t, send_t}, return_when=asyncio.FIRST_COMPLETED)
+        except KeyboardInterrupt:
+            done = {send_t}
         finally:
+            ticker_t.cancel()
+            try:
+                await ticker_t
+            except asyncio.CancelledError:
+                pass
             await ws.close()
+            for t in (recv_t, send_t):
+                if not t.done():
+                    t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
 
 
-# ============================================================
-# Classic-mode main loop
-# ============================================================
-async def _classic_chat(
-    url: str,
-    username: str,
-    password: str,
-    console: Console,
-) -> None:
+async def _classic_chat(url: str, username: str, password: str, console: Console) -> None:
+    _username = username
+
     import websockets
-
     try:
-        ws = await websockets.connect(url)
-    except Exception as exc:
-        console.print(f"[err]Could not connect: {exc}[/]")
+        ws = await asyncio.wait_for(websockets.connect(url), timeout=_CONNECT_TIMEOUT)
+    except OSError as exc:
+        console.print(f"[red]✗ can't reach {url}: {exc}[/]")
         sys.exit(1)
 
-    out = ClassicOutput(console)
     await ws.send(json.dumps({"username": username, "password": password}))
+    console.print(f"[green]connected[/] as '[bold]{username}[/]'.  /quit to leave.\n")
 
     async def receive():
         async for raw in ws:
@@ -358,7 +363,7 @@ async def _classic_chat(
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            out.print(msg)
+            print_classic(msg)
 
     async def send():
         loop = asyncio.get_running_loop()
@@ -367,50 +372,49 @@ async def _classic_chat(
             if not line:
                 break
             text = line.rstrip("\n")
-            if text.lower() in ("/quit", "/exit"):
+            if text.lower() in ("/quit", "/exit", "/q"):
                 break
-            await ws.send(json.dumps({"message": text}))
+            if text.strip():
+                await ws.send(json.dumps({"message": text}))
 
-    console.print(f"[ok]Connected as '{username}'[/].  Type /quit to leave.")
     try:
         await asyncio.gather(receive(), send())
-    except asyncio.CancelledError:
+    except KeyboardInterrupt:
         pass
     finally:
         await ws.close()
 
 
-# ============================================================
-# Public entry-points called from cli.py
-# ============================================================
-def chat(
-    url: str,
-    username: str,
-    password: str = "",
-    mode: str | None = None,
-) -> None:
-    """Main client entry point.
+# ════════════════════════════════════════════════════════════════════════════
+# Public entry point
+# ════════════════════════════════════════════════════════════════════════════
+
+def chat(url: str = "ws://localhost:8765", username: str = "", password: str = "",
+         mode: str | None = None) -> None:
+    """Connect to the broadcast server and run the TUI.
 
     Parameters
     ----------
-    url, username, password:
-        Forwarded to the server.
+    url:
+        WebSocket server URL.
+    username:
+        Display name sent to the server on connect.
+    password:
+        Server auth password (empty string = no-auth mode).
     mode:
-        ``"classic"`` | ``"fancy"`` | ``None`` – ``None`` respects the
-        ``BROADCAST_UI`` env-var, defaulting to ``fancy`` when Rich is
-        available.
+        ``'fancy'`` | ``'classic'`` | ``None``.
+        ``None`` respects the ``BROADCAST_UI`` env-var; defaults to
+        ``fancy`` when Rich is importable, ``classic`` otherwise.
     """
+    if not HAS_RICH and mode in (None, "fancy"):
+        mode = "classic"
+
     if mode is None:
         mode = os.environ.get("BROADCAST_UI", "fancy" if HAS_RICH else "classic")
 
-    console = _make_console(no_color=(mode == "classic" and not HAS_RICH))
+    console = _make_console()
 
     if mode == "fancy" and HAS_RICH:
         asyncio.run(_fancy_chat(url, username, password, console))
     else:
         asyncio.run(_classic_chat(url, username, password, console))
-
-
-def connect(*args, **kwargs):
-    """Thin wrapper kept for backwards-compatibility."""
-    chat(*args, **kwargs)
